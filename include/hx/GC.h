@@ -13,7 +13,9 @@
 #define HX_GC_CONST_ALLOC_BIT  0x80000000
 #define HX_GC_CONST_ALLOC_MARK_BIT  0x80
 
-
+// Track last allocations for MarkConservative
+// effectively fixes an Android crash for missing ptrs
+#define IMMIX_TRACK_LAST_ALLOCATIONS 64
 
 
 // Tell compiler the extra functions are supported
@@ -289,7 +291,16 @@ namespace hx
 
 
 // Each line ast 128 bytes (2^7)
+#if defined(HXCPP_GC_SHORT_ROWS)
+// Each line ast 64 bytes (2^6)
+#define IMMIX_LINE_BITS    6
+// This is necessary to allow IMMIX_LINE_BITS < 7
+#define IMMIX_LOOP_COUNT_ROWS  
+#else
+// Each line ast 128 bytes (2^7)
 #define IMMIX_LINE_BITS    7
+#endif
+
 #define IMMIX_LINE_LEN     (1<<IMMIX_LINE_BITS)
 
 #define HX_GC_REMEMBERED          0x40
@@ -315,8 +326,6 @@ namespace hx
    #define HX_GC_CONST_ALLOC_MARK_OFFSET   -1
    #define HX_ENDIAN_MARK_ID_BYTE       -1
 #endif
-
-
 
 // The gPauseForCollect bits will turn spaceEnd negative, and so force the slow path
 #ifndef HXCPP_SINGLE_THREADED_APP
@@ -345,6 +354,9 @@ public:
    virtual ~ImmixAllocator() {}
    virtual void *CallAlloc(int inSize,unsigned int inObjectFlags) = 0;
    virtual void SetupStack() = 0;
+#ifdef IMMIX_TRACK_LAST_ALLOCATIONS
+   virtual void PushLocalPtr(void *ptr, bool large, bool container) = 0;
+#endif
 
    #ifdef HXCPP_GC_NURSERY
    unsigned char  *spaceFirst;
@@ -362,9 +374,16 @@ public:
    inline static void *alloc(ImmixAllocator *alloc, size_t inSize, bool inContainer, const char *inName )
    {
       #ifdef HXCPP_GC_NURSERY
-
+		     
+		     #if defined(HXCPP_VISIT_ALLOCS) && defined(HXCPP_M64)
+		     // Make sure we can fit a relocation pointer
+		     int allocSize = sizeof(int) + (inSize < 8 ? 8 : inSize);
+		     #else
+		     int allocSize = sizeof(int) + inSize;
+		     #endif
+		     
          unsigned char *buffer = alloc->spaceFirst;
-         unsigned char *end = buffer + (inSize + 4);
+         unsigned char *end = buffer + allocSize;
 
          if ( end > alloc->spaceOversize )
          {
@@ -376,15 +395,19 @@ public:
             alloc->spaceFirst = end;
 
             if (inContainer)
-               ((unsigned int *)buffer)[-1] = inSize | IMMIX_ALLOC_IS_CONTAINER;
+               ((unsigned int *)buffer)[-1] = (allocSize - 4)  | IMMIX_ALLOC_IS_CONTAINER;
             else
-               ((unsigned int *)buffer)[-1] = inSize;
+               ((unsigned int *)buffer)[-1] = (allocSize - 4) ;
          }
+
 
          #ifdef HXCPP_TELEMETRY
          __hxt_gc_new((hx::StackContext *)alloc,buffer, inSize, inName);
          #endif
-
+#ifdef IMMIX_TRACK_LAST_ALLOCATIONS
+         if (inContainer)
+		     	alloc->PushLocalPtr(buffer, false, inContainer);
+#endif
          return buffer;
 
       #else
@@ -420,6 +443,10 @@ public:
                #ifdef HXCPP_TELEMETRY
                __hxt_gc_new((hx::StackContext *)alloc,buffer, inSize, inName);
                #endif
+#ifdef IMMIX_TRACK_LAST_ALLOCATIONS        
+               if (inContainer)       
+		     				alloc->PushLocalPtr(buffer, false, inContainer);
+#endif
                return buffer;
             }
          #endif // HXCPP_ALIGN_ALLOC
@@ -570,11 +597,4 @@ inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx)
 
 #define HX_VISIT_ARRAY(ioPtr) { if (ioPtr) __inCtx->visitAlloc((void **)&ioPtr); }
 
-
-
-
-
-
-
 #endif
-
